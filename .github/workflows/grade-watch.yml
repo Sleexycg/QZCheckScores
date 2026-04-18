@@ -1,0 +1,44 @@
+name: QZCheckScores
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-grade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run grade watch
+        env:
+          JW_BASE_URL: ${{ secrets.JW_BASE_URL }}
+          JW_STUDENT_ID: ${{ secrets.JW_STUDENT_ID }}
+          JW_PASSWORD: ${{ secrets.JW_PASSWORD }}
+          WATCH_TERM: ${{ secrets.WATCH_TERM }}
+          SHOWDOC_PUSH_URL: ${{ secrets.SHOWDOC_PUSH_URL }}
+          GRADE_HASH_A_PATH: Hash_New.txt
+          GRADE_HASH_B_PATH: Hash_Origin.txt
+        run: node main.mjs
+
+      - name: Commit snapshot if changed
+        run: |
+          if git diff --quiet Hash_New.txt Hash_Origin.txt; then
+            echo "No snapshot change."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Hash_New.txt Hash_Origin.txt
+          git commit -m "chore: update grade hash files"
+          git push
