@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { setDefaultResultOrder } from "node:dns";
 
 function loadLocalEnv() {
   const candidates = [
@@ -30,6 +31,12 @@ function loadLocalEnv() {
 }
 
 loadLocalEnv();
+
+try {
+  setDefaultResultOrder("ipv4first");
+} catch {
+  // ignore
+}
 
 const BASE_URL = (process.env.JW_BASE_URL || "https://jw.sdau.edu.cn").replace(/\/+$/, "");
 const STUDENT_ID = (process.env.JW_STUDENT_ID || "").trim();
@@ -641,3 +648,5 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+
+
