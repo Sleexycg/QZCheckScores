@@ -1,4 +1,4 @@
-﻿import fs from "node:fs";
+import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 
@@ -40,6 +40,8 @@ const HASH_A_PATH = process.env.GRADE_HASH_A_PATH || "Hash_New.txt";
 const HASH_B_PATH = process.env.GRADE_HASH_B_PATH || "Hash_Origin.txt";
 const DEBUG_LOGIN = String(process.env.DEBUG_LOGIN || "").trim() === "1";
 const FORCE_PUSH = process.argv.includes("--force-push");
+const REQUEST_TIMEOUT_MS = Number.parseInt(String(process.env.JW_TIMEOUT_MS || "30000"), 10);
+const REQUEST_RETRY_COUNT = Number.parseInt(String(process.env.JW_RETRY_COUNT || "2"), 10);
 
 function assertRequired() {
   if (!STUDENT_ID || !PASSWORD) {
@@ -422,6 +424,31 @@ function getSetCookieHeaders(res) {
   return raw ? raw.split(/, (?=[^;]+?=)/g) : [];
 }
 
+async function fetchWithRetry(url, options) {
+  const retries = Number.isFinite(REQUEST_RETRY_COUNT) && REQUEST_RETRY_COUNT >= 0 ? REQUEST_RETRY_COUNT : 2;
+  const timeoutMs = Number.isFinite(REQUEST_TIMEOUT_MS) && REQUEST_TIMEOUT_MS > 0 ? REQUEST_TIMEOUT_MS : 30000;
+
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      return res;
+    } catch (err) {
+      clearTimeout(timer);
+      lastError = err;
+      if (attempt < retries) {
+        const backoff = 500 * (attempt + 1);
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+        continue;
+      }
+    }
+  }
+  throw lastError;
+}
+
 async function jwRequest(pathname, { method = "GET", body, cookieHeader = "", referer = "" } = {}) {
   const headers = {
     "User-Agent":
@@ -432,7 +459,13 @@ async function jwRequest(pathname, { method = "GET", body, cookieHeader = "", re
   if (referer) headers.Referer = referer;
   if (method === "POST") headers["Content-Type"] = "application/x-www-form-urlencoded";
 
-  const res = await fetch(`${BASE_URL}${pathname}`, { method, headers, body, redirect: "follow", cache: "no-store" });
+  const res = await fetchWithRetry(`${BASE_URL}${pathname}`, {
+    method,
+    headers,
+    body,
+    redirect: "follow",
+    cache: "no-store",
+  });
   const text = await res.text();
   const setCookie = getSetCookieHeaders(res);
   return {
