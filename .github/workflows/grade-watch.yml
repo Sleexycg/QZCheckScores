@@ -5,6 +5,10 @@ on:
     - cron: "*/30 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: qzcheckscores-main
+  cancel-in-progress: false
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -42,7 +46,22 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git rebase origin/main || (git rebase --abort && git reset --hard origin/main)
           git add Hash_New.txt Hash_Origin.txt
+          if git diff --cached --quiet; then
+            echo "Nothing to commit after rebase/reset."
+            exit 0
+          fi
           git commit -m "chore: update grade hash files"
-          git pull --rebase origin main
-          git push origin main || (git pull --rebase origin main && git push origin main)
+          for i in 1 2 3; do
+            git pull --rebase origin main
+            if git push origin HEAD:main; then
+              echo "Push succeeded on attempt $i"
+              exit 0
+            fi
+            echo "Push failed on attempt $i, retrying..."
+            sleep 2
+          done
+          echo "Push failed after retries."
+          exit 1
