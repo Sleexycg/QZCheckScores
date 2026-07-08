@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { setDefaultResultOrder } from "node:dns";
+import readline from "node:readline";
+import { execSync } from "node:child_process";
 
 function loadLocalEnv() {
   const candidates = [
@@ -30,6 +32,35 @@ function loadLocalEnv() {
   }
 }
 
+async function createDefaultEnvLocal() {
+  const envPath = path.resolve(process.cwd(), ".env.local");
+  if (fs.existsSync(envPath)) return;
+  const term = inferDefaultTerm();
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q) => new Promise((res) => rl.question(q, res));
+  console.log("首次运行，检测到未配置 .env.local，请输入以下信息：");
+  const studentId = (await ask("教务系统账号（回车跳过）：")).trim();
+  const password = (await ask("教务系统密码（回车跳过）：")).trim();
+  const pushUrl = (await ask("微信ShowDoc推送地址（回车跳过）：")).trim();
+  rl.close();
+  const content = [
+    "##教务系统地址（无需修改）",
+    "JW_BASE_URL=https://jw.sdau.edu.cn",
+    "##教务系统账号",
+    `JW_STUDENT_ID=${studentId}`,
+    "##教务系统密码",
+    `JW_PASSWORD=${password}`,
+    "##微信ShowDoc推送地址",
+    `SHOWDOC_PUSH_URL=${pushUrl}`,
+    "##学期，参照格式：2025-2026-2",
+    `WATCH_TERM=${term}`,
+    "",
+  ].join("\n");
+  fs.writeFileSync(envPath, content, "utf8");
+  console.log("配置已保存，继续运行...\n");
+}
+
+await createDefaultEnvLocal();
 loadLocalEnv();
 
 try {
@@ -59,10 +90,10 @@ function assertRequired() {
 function inferDefaultTerm() {
   const now = new Date();
   const month = now.getMonth() + 1;
-  const startYear = month >= 8 ? now.getFullYear() : now.getFullYear() - 1;
-  const endYear = startYear + 1;
-  const termNo = month >= 2 && month <= 7 ? 2 : 1;
-  return `${startYear}-${endYear}-${termNo}`;
+  const year = now.getFullYear();
+  if (month >= 9) return `${year}-${year + 1}-1`;
+  if (month <= 2) return `${year - 1}-${year}-1`;
+  return `${year - 1}-${year}-2`;
 }
 
 function encodeInp(input) {
@@ -294,9 +325,26 @@ async function fetchTotalGpa(cookieHeader) {
   }
 }
 
+function scoreToGrade(score, usualScore, finalScore) {
+  const gradeScores = [65, 75, 85, 95];
+  const num = Number.parseFloat(String(score));
+  const isGradeOnly =
+    !usualScore || usualScore === "-" ||
+    (usualScore === finalScore && gradeScores.includes(num));
+  if (!isGradeOnly) return score;
+  if (!Number.isFinite(num)) return score;
+  if (num >= 90) return "优秀";
+  if (num >= 80) return "良好";
+  if (num >= 70) return "中等";
+  if (num >= 60) return "通过";
+  return "不及格";
+}
+
 function formatPushMessage(term, records, profile, totalGpa, mode = "update") {
   const termGpa = calculateCurrentGpa(records);
   const overallGpa = totalGpa || "-";
+  const now = new Date();
+  const updateTime = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
   const lines =
     mode === "init"
       ? [
@@ -325,6 +373,8 @@ function formatPushMessage(term, records, profile, totalGpa, mode = "update") {
           "教务系统成绩已更新",
           "",
           `学期：${term}`,
+          `更新时间：${updateTime}`,
+          `更新科目：${records.length}门`,
           "",
           "---",
           "",
@@ -345,11 +395,12 @@ function formatPushMessage(term, records, profile, totalGpa, mode = "update") {
 
   for (const r of records) {
     lines.push(`课程名称：${r.courseName || "-"}`);
+    const displayScore = scoreToGrade(r.score, r.usualScore, r.finalScore);
     const extra =
       r?.usualScore || r?.finalScore
         ? `（平时：${r?.usualScore || "-"}，期末：${r?.finalScore || "-"}）`
         : "";
-    lines.push(`成绩：${r.score || "-"}${extra}`);
+    lines.push(`成绩：${displayScore}${extra}`);
     lines.push(`学分：${r.credit || "-"}`);
     lines.push("");
     lines.push("---");
@@ -358,7 +409,62 @@ function formatPushMessage(term, records, profile, totalGpa, mode = "update") {
   return lines.join("\n").trim();
 }
 
-async function sendPush(title, content) {
+function formatWindowsNotification(term, records, profile, totalGpa, mode = "update") {
+  const termGpa = calculateCurrentGpa(records);
+  const overallGpa = totalGpa || "-";
+  const now = new Date();
+  const updateTime = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+  const lines = [
+    mode === "init" ? "程序启动成功" : "成绩已更新",
+    `学期：${term}`,
+    `更新时间：${updateTime}`,
+    `更新科目：${records.length}门`,
+    `${profile?.name || "-"} | ${profile?.className || "-"}`,
+    `本学期GPA：${termGpa} | 总GPA：${overallGpa}`,
+    "",
+  ];
+  for (const r of records) {
+    const displayScore = scoreToGrade(r.score, r.usualScore, r.finalScore);
+    const extra =
+      r?.usualScore || r?.finalScore
+        ? `（${r?.usualScore || "-"} / ${r?.finalScore || "-"}）`
+        : "";
+    lines.push(`${r.courseName || "-"}：${displayScore}${extra} (${r.credit || "-"}学分)`);
+  }
+  return lines.join("\r\n");
+}
+
+function sendWindowsNotification(title, content) {
+  const escapedTitle = title.replace(/"/g, '""');
+  const escapedContent = content.replace(/"/g, '""');
+  const psScript = `Add-Type -AssemblyName System.Windows.Forms
+$notify = New-Object System.Windows.Forms.NotifyIcon
+$notify.Icon = [System.Drawing.SystemIcons]::Information
+$notify.BalloonTipTitle = "${escapedTitle}"
+$notify.BalloonTipText = "${escapedContent}"
+$notify.Visible = $true
+$notify.ShowBalloonTip(10000)
+Start-Sleep -Seconds 3
+$notify.Dispose()
+`;
+  const scriptPath = path.join(process.env.TEMP || ".", "qzcheckscores_notify.ps1");
+  try {
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const contentBuffer = Buffer.from(psScript, "utf8");
+    fs.writeFileSync(scriptPath, Buffer.concat([bom, contentBuffer]));
+    execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"`, { stdio: "ignore" });
+    console.log("Windows notification sent.");
+  } catch {
+    console.log("Windows notification failed, falling back to console output.");
+    console.log(`\n[${title}]\n${content}\n`);
+  }
+}
+
+async function sendPush(title, content, windowsContent) {
+  if (process.platform === "win32") {
+    sendWindowsNotification(title, windowsContent || content);
+    if (!PUSH_URL) return;
+  }
   if (!PUSH_URL) {
     console.log("SHOWDOC_PUSH_URL not configured, skip push.");
     return;
@@ -621,7 +727,8 @@ async function main() {
     isSame = runABComparisonStep(scoreHash);
     const title = "强智教务系统成绩推送";
     const content = formatPushMessage(term, recordsWithDetail, profile, totalGpa, "init");
-    await sendPush(title, content);
+    const winContent = formatWindowsNotification(term, recordsWithDetail, profile, totalGpa, "init");
+    await sendPush(title, content, winContent);
     console.log("First run push sent.");
     return;
   }
@@ -630,7 +737,8 @@ async function main() {
     if (FORCE_PUSH) {
       const title = "强智教务系统成绩推送";
       const content = formatPushMessage(term, recordsWithDetail, profile, totalGpa, "update");
-      await sendPush(title, content);
+      const winContent = formatWindowsNotification(term, recordsWithDetail, profile, totalGpa, "update");
+      await sendPush(title, content, winContent);
       console.log("Force push sent (manual test).");
       return;
     }
@@ -640,7 +748,8 @@ async function main() {
 
   const title = "强智教务系统成绩推送";
   const content = formatPushMessage(term, recordsWithDetail, profile, totalGpa, "update");
-  await sendPush(title, content);
+  const winContent = formatWindowsNotification(term, recordsWithDetail, profile, totalGpa, "update");
+  await sendPush(title, content, winContent);
   console.log("Hash changed and push sent.");
 }
 

@@ -2,7 +2,7 @@ name: QZCheckScores
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -11,6 +11,7 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NODE_OPTIONS: "--dns-result-order=ipv4first"
 
 permissions:
   contents: write
@@ -34,6 +35,8 @@ jobs:
           JW_PASSWORD: ${{ secrets.JW_PASSWORD }}
           WATCH_TERM: ${{ secrets.WATCH_TERM }}
           SHOWDOC_PUSH_URL: ${{ secrets.SHOWDOC_PUSH_URL }}
+          JW_TIMEOUT_MS: "45000"
+          JW_RETRY_COUNT: "3"
           GRADE_HASH_A_PATH: Hash_New.txt
           GRADE_HASH_B_PATH: Hash_Origin.txt
         run: node main.mjs
@@ -44,22 +47,35 @@ jobs:
             echo "No snapshot change."
             exit 0
           fi
+
+          HASH_NEW_CONTENT="$(cat Hash_New.txt)"
+          HASH_ORIGIN_CONTENT="$(cat Hash_Origin.txt)"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Hash_New.txt Hash_Origin.txt
-          if git diff --cached --quiet; then
-            echo "Nothing to commit."
-            exit 0
-          fi
-          git commit -m "chore: update grade hash files"
-          for i in 1 2 3; do
-            git pull --rebase origin main || (git rebase --abort || true)
+
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            git reset --hard origin/main
+
+            printf "%s" "$HASH_NEW_CONTENT" > Hash_New.txt
+            printf "%s" "$HASH_ORIGIN_CONTENT" > Hash_Origin.txt
+
+            git add Hash_New.txt Hash_Origin.txt
+            if git diff --cached --quiet; then
+              echo "Nothing to commit."
+              exit 0
+            fi
+
+            git commit -m "chore: update grade hash files"
             if git push origin HEAD:main; then
               echo "Push succeeded on attempt $i"
               exit 0
             fi
+
             echo "Push failed on attempt $i, retrying..."
             sleep 2
           done
+
           echo "Push failed after retries."
           exit 1
