@@ -87,6 +87,19 @@ function assertRequired() {
   }
 }
 
+function parseCommaSeparated(str) {
+  return str.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+}
+
+function buildAccountList() {
+  const ids = parseCommaSeparated(STUDENT_ID);
+  const passwords = parseCommaSeparated(PASSWORD);
+  if (ids.length !== passwords.length) {
+    throw new Error(`账号数量(${ids.length})与密码数量(${passwords.length})不匹配`);
+  }
+  return ids.map((id, i) => ({ studentId: id, password: passwords[i] }));
+}
+
 function inferDefaultTerm() {
   const now = new Date();
   const month = now.getMonth() + 1;
@@ -260,19 +273,19 @@ function writeHashFile(filePath, value) {
   fs.writeFileSync(filePath, value, "utf8");
 }
 
-function runABComparisonStep(currentHash) {
+function runABComparisonStep(currentHash, hashAPath = HASH_A_PATH, hashBPath = HASH_B_PATH) {
   // 1) 清空 B
-  writeHashFile(HASH_B_PATH, "");
+  writeHashFile(hashBPath, "");
   // 2) 将 A 内容写入 B
-  const hashAOld = readHashFile(HASH_A_PATH);
-  writeHashFile(HASH_B_PATH, hashAOld);
+  const hashAOld = readHashFile(hashAPath);
+  writeHashFile(hashBPath, hashAOld);
   // 3) 清空 A
-  writeHashFile(HASH_A_PATH, "");
+  writeHashFile(hashAPath, "");
   // 4/5) 将本次成绩 MD5 写入 A
-  writeHashFile(HASH_A_PATH, currentHash);
+  writeHashFile(hashAPath, currentHash);
   // 6) 比对 A 与 B
-  const hashANow = readHashFile(HASH_A_PATH);
-  const hashBNow = readHashFile(HASH_B_PATH);
+  const hashANow = readHashFile(hashAPath);
+  const hashBNow = readHashFile(hashBPath);
   return hashANow === hashBNow;
 }
 
@@ -298,31 +311,76 @@ function calculateCurrentGpa(records) {
   return "-";
 }
 
-function parseTotalGpaFromSummaryPayload(payload) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "";
-  const raw = String(payload.pjxfjd ?? "").trim();
-  return raw;
+function generateSemesters(enrollmentYear, currentTerm) {
+  const semesters = [];
+  const currentParts = currentTerm.split("-");
+  const currentStartYear = Number.parseInt(currentParts[0], 10);
+  const currentSemester = Number.parseInt(currentParts[2], 10);
+
+  for (let year = enrollmentYear; year <= currentStartYear; year++) {
+    for (let sem = 1; sem <= 2; sem++) {
+      if (year === enrollmentYear && sem === 1) {
+        semesters.push(`${year}-${year + 1}-1`);
+      } else if (year > enrollmentYear || sem > 1) {
+        const termStr = `${year}-${year + 1}-${sem}`;
+        if (year < currentStartYear || (year === currentStartYear && sem <= currentSemester)) {
+          semesters.push(termStr);
+        }
+      }
+    }
+  }
+
+  if (semesters.length === 0) {
+    semesters.push(`${enrollmentYear}-${enrollmentYear + 1}-1`);
+  }
+
+  return semesters;
 }
 
-async function fetchTotalGpa(cookieHeader) {
-  const query = new URLSearchParams({
-    pageNum: "1",
-    pageSize: "200",
-    kksj: "",
-    kcxz: "",
-    kcsx: "",
-    kcmc: "",
-    xsfs: "all",
-    sfxsbcxq: "1",
-  });
-  const response = await jwRequest(`/kscj/cjcx_list?${query.toString()}`, { cookieHeader });
-  if (!response.ok || isLoginPage(response.text)) return "";
-  try {
-    const payload = JSON.parse(response.text.replace(/^\uFEFF/, "").trim());
-    return parseTotalGpaFromSummaryPayload(payload);
-  } catch {
+async function fetchTotalGpa(cookieHeader, studentId, currentTerm) {
+  const enrollmentYear = Number.parseInt(studentId.slice(0, 4), 10);
+  if (!Number.isFinite(enrollmentYear) || enrollmentYear < 2000 || enrollmentYear > 2100) {
     return "";
   }
+
+  const semesters = generateSemesters(enrollmentYear, currentTerm);
+  let totalCreditPoint = 0;
+  let totalCredit = 0;
+
+  for (const term of semesters) {
+    const query = new URLSearchParams({
+      pageNum: "1",
+      pageSize: "200",
+      kksj: term,
+      kcxz: "",
+      kcsx: "",
+      kcmc: "",
+      xsfs: "all",
+      sfxsbcxq: "1",
+    });
+
+    try {
+      const response = await jwRequest(`/kscj/cjcx_list?${query.toString()}`, { cookieHeader });
+      if (!response.ok || isLoginPage(response.text)) continue;
+
+      const payload = JSON.parse(response.text.replace(/^\uFEFF/, "").trim());
+      const rows = normalizeRows(payload);
+
+      for (const row of rows) {
+        const xf = Number.parseFloat(String(row.xf ?? ""));
+        const jd = Number.parseFloat(String(row.jd ?? ""));
+        if (Number.isFinite(xf) && xf > 0 && Number.isFinite(jd)) {
+          totalCreditPoint += xf * jd;
+          totalCredit += xf;
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  if (totalCredit > 0) return (totalCreditPoint / totalCredit).toFixed(2);
+  return "";
 }
 
 function scoreToGrade(score, usualScore, finalScore) {
@@ -590,14 +648,14 @@ async function jwRequest(pathname, { method = "GET", body, cookieHeader = "", re
   };
 }
 
-async function login() {
+async function login(studentId, password) {
   const homepage = await jwRequest("/");
   const { scode, sxh } = extractLoginSeed(homepage.text);
-  const encoded = buildEncodedCredential(STUDENT_ID, PASSWORD, scode, sxh);
+  const encoded = buildEncodedCredential(studentId, password, scode, sxh);
   const body = new URLSearchParams({
     loginMethod: "LoginToXk",
     userlanguage: "0",
-    userAccount: STUDENT_ID,
+    userAccount: studentId,
     userPassword: "",
     encoded,
   });
@@ -609,7 +667,7 @@ async function login() {
   });
   const loginMessage = parseLoginMessage(loginResult.text);
   if (DEBUG_LOGIN) {
-    console.log(`[login] JW_STUDENT_ID.len=${STUDENT_ID.length}, JW_PASSWORD.len=${PASSWORD.length}, msg=${loginMessage || "(empty)"}`);
+    console.log(`[login] studentId.len=${studentId.length}, password.len=${password.length}, msg=${loginMessage || "(empty)"}`);
   }
   if (loginMessage && !/请先登录系统/i.test(loginMessage)) throw new Error(`Login failed: ${loginMessage}`);
   if (isLoginPage(loginResult.text)) throw new Error("Login failed: invalid credentials or blocked");
@@ -706,51 +764,67 @@ async function fetchStudentProfile(cookieHeader) {
   return { name: "", studentId: "", className: "", college: "" };
 }
 
+async function processAccount(studentId, password, term, index) {
+  const tag = `[${index}] ${studentId}`;
+
+  const hashA = index === 0 ? HASH_A_PATH : `Hash_New_${index}.txt`;
+  const hashB = index === 0 ? HASH_B_PATH : `Hash_Origin_${index}.txt`;
+
+  try {
+    const cookie = await login(studentId, password);
+    const profile = await fetchStudentProfile(cookie);
+    const records = await fetchScores(cookie, term);
+    const recordsWithDetail = await enrichScoresWithUsualFinal(cookie, records);
+    const totalGpa = await fetchTotalGpa(cookie, studentId, term);
+    const scoreHash = md5(serializeScoresForHash(records));
+
+    const firstRun = !readHashFile(hashA) && !readHashFile(hashB);
+    let isSame = runABComparisonStep(scoreHash, hashA, hashB);
+    if (firstRun) {
+      isSame = runABComparisonStep(scoreHash, hashA, hashB);
+      const title = `强智教务系统成绩推送 - ${profile.name || studentId}`;
+      const content = formatPushMessage(term, recordsWithDetail, profile, totalGpa, "init");
+      const winContent = formatWindowsNotification(term, recordsWithDetail, profile, totalGpa, "init");
+      await sendPush(title, content, winContent);
+      console.log(`${tag} 首次运行推送完成。`);
+      return;
+    }
+
+    if (isSame) {
+      if (FORCE_PUSH) {
+        const title = `强智教务系统成绩推送 - ${profile.name || studentId}`;
+        const content = formatPushMessage(term, recordsWithDetail, profile, totalGpa, "update");
+        const winContent = formatWindowsNotification(term, recordsWithDetail, profile, totalGpa, "update");
+        await sendPush(title, content, winContent);
+        console.log(`${tag} 强制推送完成。`);
+        return;
+      }
+      console.log(`${tag} 成绩无变化。`);
+      return;
+    }
+
+    const title = `强智教务系统成绩推送 - ${profile.name || studentId}`;
+    const content = formatPushMessage(term, recordsWithDetail, profile, totalGpa, "update");
+    const winContent = formatWindowsNotification(term, recordsWithDetail, profile, totalGpa, "update");
+    await sendPush(title, content, winContent);
+    console.log(`${tag} 成绩已更新，推送完成。`);
+  } catch (err) {
+    console.error(`${tag} 检测失败: ${err.message}`);
+  }
+}
+
 async function main() {
   assertRequired();
   if (DEBUG_LOGIN) {
-    console.log(`[env] studentId.len=${STUDENT_ID.length}, password.len=${PASSWORD.length}, base=${BASE_URL}`);
+    console.log(`[env] base=${BASE_URL}`);
   }
 
   const term = WATCH_TERM || inferDefaultTerm();
-  const cookie = await login();
-  const profile = await fetchStudentProfile(cookie);
-  const records = await fetchScores(cookie, term);
-  const recordsWithDetail = await enrichScoresWithUsualFinal(cookie, records);
-  const totalGpa = await fetchTotalGpa(cookie);
-  const scoreHash = md5(serializeScoresForHash(records));
+  const accounts = buildAccountList();
 
-  const firstRun = !readHashFile(HASH_A_PATH) && !readHashFile(HASH_B_PATH);
-  let isSame = runABComparisonStep(scoreHash);
-  if (firstRun) {
-    // 首次运行，按要求执行两遍
-    isSame = runABComparisonStep(scoreHash);
-    const title = "强智教务系统成绩推送";
-    const content = formatPushMessage(term, recordsWithDetail, profile, totalGpa, "init");
-    const winContent = formatWindowsNotification(term, recordsWithDetail, profile, totalGpa, "init");
-    await sendPush(title, content, winContent);
-    console.log("First run push sent.");
-    return;
+  for (let i = 0; i < accounts.length; i++) {
+    await processAccount(accounts[i].studentId, accounts[i].password, term, i);
   }
-
-  if (isSame) {
-    if (FORCE_PUSH) {
-      const title = "强智教务系统成绩推送";
-      const content = formatPushMessage(term, recordsWithDetail, profile, totalGpa, "update");
-      const winContent = formatWindowsNotification(term, recordsWithDetail, profile, totalGpa, "update");
-      await sendPush(title, content, winContent);
-      console.log("Force push sent (manual test).");
-      return;
-    }
-    console.log("No new score update.");
-    return;
-  }
-
-  const title = "强智教务系统成绩推送";
-  const content = formatPushMessage(term, recordsWithDetail, profile, totalGpa, "update");
-  const winContent = formatWindowsNotification(term, recordsWithDetail, profile, totalGpa, "update");
-  await sendPush(title, content, winContent);
-  console.log("Hash changed and push sent.");
 }
 
 main().catch((err) => {
